@@ -2616,6 +2616,30 @@ object ConvertToLocalRelation extends Rule[LogicalPlan] {
       predicate.initialize(0)
       LocalRelation(output, data.filter(row => predicate.eval(row)), isStreaming, stream)
 
+    // Evaluate a fully local left anti join without introducing a physical join or Spark job.
+    // This intentionally uses the join predicate itself so regular and null-aware anti joins keep
+    // their existing three-valued-logic semantics.
+    case Join(
+        LocalRelation(leftOutput, leftData, false, _),
+        LocalRelation(rightOutput, rightData, false, _),
+        LeftAnti,
+        condition,
+        _) if condition.forall(expr => !hasUnevaluableExpr(expr)) =>
+      val filteredData = condition match {
+        case Some(joinCondition) =>
+          val predicate = Predicate.create(joinCondition, leftOutput ++ rightOutput)
+          predicate.initialize(0)
+          val joinedRow = new JoinedRow
+          leftData.filterNot { leftRow =>
+            rightData.exists(rightRow => predicate.eval(joinedRow(leftRow, rightRow)))
+          }
+        case None if rightData.nonEmpty =>
+          Nil
+        case None =>
+          leftData
+      }
+      LocalRelation(leftOutput, filteredData)
+
     // A left anti join only keeps a row from the left side when the join condition does not
     // evaluate to true for any row on the right side. When the right side is a single-row local
     // relation, replace its attributes with literals and express that existence check as a filter.

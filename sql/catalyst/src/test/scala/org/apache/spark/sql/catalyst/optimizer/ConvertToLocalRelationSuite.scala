@@ -104,6 +104,32 @@ class ConvertToLocalRelationSuite extends PlanTest {
     comparePlans(optimized, correctAnswer)
   }
 
+  test("left anti join between multi-row LocalRelations should be evaluated locally") {
+    val left = LocalRelation(
+      Seq($"a".int),
+      Seq(InternalRow(1), InternalRow(2), InternalRow(3), InternalRow(4), InternalRow(null)))
+    val right = LocalRelation(
+      Seq($"b".int),
+      Seq(InternalRow(2), InternalRow(4)))
+    val condition = EqualTo(left.output.head, right.output.head)
+
+    val optimized = Optimize.execute(
+      Join(left, right, LeftAnti, Some(condition), JoinHint.NONE))
+    val correctAnswer = LocalRelation(
+      left.output,
+      Seq(InternalRow(1), InternalRow(3), InternalRow(null)))
+
+    comparePlans(optimized, correctAnswer)
+  }
+
+  test("left anti join without a condition should be evaluated locally") {
+    val left = LocalRelation(Seq($"a".int), Seq(InternalRow(1), InternalRow(2)))
+    val right = LocalRelation(Seq($"b".int), Seq(InternalRow(3)))
+    val join = Join(left, right, LeftAnti, None, JoinHint.NONE)
+
+    comparePlans(Optimize.execute(join), LocalRelation(left.output))
+  }
+
   test("left anti join conversion should preserve null semantics") {
     val left = LocalRelation(
       Seq($"a".int),
