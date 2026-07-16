@@ -33,8 +33,8 @@ class LocalRelationLeftAntiJoinSuite extends QueryTest with SharedSparkSession {
     super.sparkConf.set(SQLConf.OPTIMIZER_EXCLUDED_RULES.key, "")
 
   test("multi-row LocalRelation left anti join collects without a Spark job") {
-    val left = Seq((1, "a"), (2, "b"), (3, "c"), (4, "d")).toDF("id", "value")
-    val right = Seq(2, 4).toDF("id")
+    val left = (0 until 20).map(id => (id, s"value-$id")).toDF("id", "value")
+    val right = (10 until 30).toDF("id")
     val result = left.join(right, Seq("id"), "left_anti")
 
     assert(result.queryExecution.optimizedPlan.isInstanceOf[LocalRelation])
@@ -50,7 +50,8 @@ class LocalRelationLeftAntiJoinSuite extends QueryTest with SharedSparkSession {
     spark.sparkContext.listenerBus.waitUntilEmpty()
     spark.sparkContext.addSparkListener(listener)
     try {
-      assert(result.collect().toSeq === Seq(Row(1, "a"), Row(3, "c")))
+      val expected = (0 until 10).map(id => Row(id, s"value-$id"))
+      assert(result.collect().toSeq === expected)
       spark.sparkContext.listenerBus.waitUntilEmpty()
       assert(jobCount.get() === 0)
     } finally {

@@ -22,13 +22,13 @@ import scala.collection.mutable.ListBuffer
 
 import org.apache.spark.SparkException
 import org.apache.spark.internal.{LogKeys}
-import org.apache.spark.sql.catalyst.SQLConfHelper
+import org.apache.spark.sql.catalyst.{InternalRow, SQLConfHelper}
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.PythonUDF.{correctEvalType, isScalarPythonUDF}
 import org.apache.spark.sql.catalyst.expressions.SubqueryExpression.hasCorrelatedSubquery
 import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.planning.PhysicalOperation
+import org.apache.spark.sql.catalyst.planning.{ExtractEquiJoinKeys, PhysicalOperation}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
@@ -36,7 +36,7 @@ import org.apache.spark.sql.catalyst.trees.AlwaysProcess
 import org.apache.spark.sql.catalyst.trees.TreePattern._
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
-import org.apache.spark.sql.catalyst.util.AUTO_GENERATED_ALIAS
+import org.apache.spark.sql.catalyst.util.{AUTO_GENERATED_ALIAS, UnsafeRowUtils}
 import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
@@ -2595,6 +2595,13 @@ object DecimalAggregates extends Rule[LogicalPlan] {
  * another `LocalRelation`.
  */
 object ConvertToLocalRelation extends Rule[LogicalPlan] {
+  // For tiny joins, avoiding hash table setup is generally faster. These thresholds are
+  // deliberately local to this rule: LocalRelation data has already been materialized on the
+  // driver.
+  private val localAntiNestedLoopMaxComparisons = 64L
+  private val perfectHashSmallRange = 1024L
+  private val perfectHashMinDensity = 0.15
+
   def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
     _.containsPattern(LOCAL_RELATION), ruleId) {
     case Project(projectList, LocalRelation(output, data, isStreaming, stream))
@@ -2616,9 +2623,32 @@ object ConvertToLocalRelation extends Rule[LogicalPlan] {
       predicate.initialize(0)
       LocalRelation(output, data.filter(row => predicate.eval(row)), isStreaming, stream)
 
-    // Evaluate a fully local left anti join without introducing a physical join or Spark job.
-    // This intentionally uses the join predicate itself so regular and null-aware anti joins keep
-    // their existing three-valued-logic semantics.
+    // For equi joins, build a driver-local membership index. A pure single-column integral join
+    // uses a BitSet when the key range is small or dense; other binary-stable keys use UnsafeRows.
+    // Residual predicates only run against rows from the matching hash bucket.
+    case ExtractEquiJoinKeys(
+        LeftAnti,
+        leftKeys,
+        rightKeys,
+        otherCondition,
+        _,
+        LocalRelation(leftOutput, leftData, false, _),
+        LocalRelation(rightOutput, rightData, false, _),
+        _) if shouldHashLocalAntiJoin(
+          leftData, rightData, leftKeys, rightKeys, otherCondition) =>
+      val filteredData = hashLocalAntiJoin(
+        leftOutput,
+        leftData,
+        rightOutput,
+        rightData,
+        leftKeys,
+        rightKeys,
+        otherCondition)
+      LocalRelation(leftOutput, filteredData)
+
+    // Evaluate all remaining fully local left anti joins without introducing a physical join or
+    // Spark job. This fallback handles non-equi and null-aware anti joins with the original
+    // predicate, preserving their three-valued-logic semantics.
     case Join(
         LocalRelation(leftOutput, leftData, false, _),
         LocalRelation(rightOutput, rightData, false, _),
@@ -2653,6 +2683,167 @@ object ConvertToLocalRelation extends Rule[LogicalPlan] {
         case attr: Attribute => literalMap.getOrElse(attr, attr)
       }
       Filter(Not(EqualNullSafe(rewrittenCondition, Literal.TrueLiteral)), left)
+  }
+
+  private def shouldHashLocalAntiJoin(
+      leftData: Seq[InternalRow],
+      rightData: Seq[InternalRow],
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      otherCondition: Option[Expression]): Boolean = {
+    leftData.length.toLong * rightData.length > localAntiNestedLoopMaxComparisons &&
+      (leftKeys ++ rightKeys).forall { key =>
+        !hasUnevaluableExpr(key) && UnsafeRowUtils.isBinaryStable(key.dataType)
+      } &&
+      otherCondition.forall(condition => !hasUnevaluableExpr(condition))
+  }
+
+  private def hashLocalAntiJoin(
+      leftOutput: Seq[Attribute],
+      leftData: Seq[InternalRow],
+      rightOutput: Seq[Attribute],
+      rightData: Seq[InternalRow],
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      otherCondition: Option[Expression]): Seq[InternalRow] = {
+    if (leftData.isEmpty || rightData.isEmpty) {
+      return leftData
+    }
+
+    if (otherCondition.isEmpty && leftKeys.length == 1 && isIntegralKey(leftKeys.head.dataType)) {
+      return integralHashLocalAntiJoin(
+        leftOutput, leftData, rightOutput, rightData, leftKeys, rightKeys)
+    }
+
+    val leftKeyProjection = localUnsafeProjection(leftKeys, leftOutput)
+    val rightKeyProjection = localUnsafeProjection(rightKeys, rightOutput)
+
+    otherCondition match {
+      case None =>
+        val rightKeySet = mutable.HashSet.empty[UnsafeRow]
+        rightData.foreach { rightRow =>
+          val key = rightKeyProjection(rightRow)
+          if (!key.anyNull) {
+            rightKeySet += key.copy()
+          }
+        }
+        leftData.filter { leftRow =>
+          val key = leftKeyProjection(leftRow)
+          key.anyNull || !rightKeySet.contains(key)
+        }
+
+      case Some(residualCondition) =>
+        val rightBuckets = mutable.HashMap.empty[UnsafeRow, mutable.ArrayBuffer[InternalRow]]
+        rightData.foreach { rightRow =>
+          val key = rightKeyProjection(rightRow)
+          if (!key.anyNull) {
+            rightBuckets.get(key) match {
+              case Some(bucket) => bucket += rightRow
+              case None =>
+                rightBuckets.put(key.copy(), mutable.ArrayBuffer(rightRow))
+            }
+          }
+        }
+
+        val predicate = Predicate.create(residualCondition, leftOutput ++ rightOutput)
+        predicate.initialize(0)
+        val joinedRow = new JoinedRow
+        leftData.filter { leftRow =>
+          val key = leftKeyProjection(leftRow)
+          key.anyNull || rightBuckets.get(key).forall { bucket =>
+            !bucket.exists(rightRow => predicate.eval(joinedRow(leftRow, rightRow)))
+          }
+        }
+    }
+  }
+
+  private def integralHashLocalAntiJoin(
+      leftOutput: Seq[Attribute],
+      leftData: Seq[InternalRow],
+      rightOutput: Seq[Attribute],
+      rightData: Seq[InternalRow],
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression]): Seq[InternalRow] = {
+    val dataType = leftKeys.head.dataType
+    val leftKeyProjection = localMutableProjection(leftKeys, leftOutput)
+    val rightKeyProjection = localMutableProjection(rightKeys, rightOutput)
+    val rightValues = new mutable.ArrayBuffer[Long](rightData.length)
+    var minValue = Long.MaxValue
+    var maxValue = Long.MinValue
+
+    rightData.foreach { rightRow =>
+      val key = rightKeyProjection(rightRow)
+      if (!key.anyNull) {
+        val value = integralKeyValue(key, dataType)
+        rightValues += value
+        minValue = math.min(minValue, value)
+        maxValue = math.max(maxValue, value)
+      }
+    }
+
+    if (rightValues.isEmpty) {
+      return leftData
+    }
+
+    val range = BigInt(maxValue) - BigInt(minValue)
+    val usePerfectHash = range < Int.MaxValue &&
+      (range < perfectHashSmallRange ||
+        rightValues.length.toDouble / (range.toLong + 1) > perfectHashMinDensity)
+
+    if (usePerfectHash) {
+      val rightKeyBits = new java.util.BitSet(range.toInt + 1)
+      rightValues.foreach(value => rightKeyBits.set((value - minValue).toInt))
+      leftData.filter { leftRow =>
+        val key = leftKeyProjection(leftRow)
+        if (key.anyNull) {
+          true
+        } else {
+          val value = integralKeyValue(key, dataType)
+          value < minValue || value > maxValue ||
+            !rightKeyBits.get((value - minValue).toInt)
+        }
+      }
+    } else {
+      val rightKeySet = mutable.LongMap.empty[Unit]
+      rightValues.foreach(value => rightKeySet.update(value, ()))
+      leftData.filter { leftRow =>
+        val key = leftKeyProjection(leftRow)
+        key.anyNull || !rightKeySet.contains(integralKeyValue(key, dataType))
+      }
+    }
+  }
+
+  private def localMutableProjection(
+      keys: Seq[Expression],
+      output: Seq[Attribute]): MutableProjection = {
+    val projection = new InterpretedMutableProjection(normalizeKeys(keys), output)
+    projection.initialize(0)
+    projection
+  }
+
+  private def localUnsafeProjection(
+      keys: Seq[Expression],
+      output: Seq[Attribute]): UnsafeProjection = {
+    val boundKeys = BindReferences.bindReferences(normalizeKeys(keys), output)
+    val projection = InterpretedUnsafeProjection.createProjection(boundKeys)
+    projection.initialize(0)
+    projection
+  }
+
+  private def normalizeKeys(keys: Seq[Expression]): Seq[Expression] = {
+    keys.map(NormalizeFloatingNumbers.normalize)
+  }
+
+  private def isIntegralKey(dataType: DataType): Boolean = dataType match {
+    case ByteType | ShortType | IntegerType | LongType => true
+    case _ => false
+  }
+
+  private def integralKeyValue(row: InternalRow, dataType: DataType): Long = dataType match {
+    case ByteType => row.getByte(0).toLong
+    case ShortType => row.getShort(0).toLong
+    case IntegerType => row.getInt(0).toLong
+    case LongType => row.getLong(0)
   }
 
   def hasUnevaluableExpr(expr: Expression): Boolean = {
